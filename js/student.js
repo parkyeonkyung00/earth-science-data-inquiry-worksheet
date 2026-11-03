@@ -9,6 +9,7 @@ import {
   SUBJ_ORDER,
   TRENDS,
   VERSIONS,
+  questionChoices,
 } from "./constants.js";
 
 const escapeHtml = value => String(value == null ? "" : value).replace(/[&<>"']/g, character => ({
@@ -27,6 +28,24 @@ export function parseCode(input, activities) {
   return activities.some(activity => activity.id === id)
     ? { id, version: match[3].toUpperCase() }
     : null;
+}
+
+function hasPrediction(version, answers) {
+  const has = key => String(answers[key] || "").trim();
+  return version === "C" ? Boolean(has("prediction_free"))
+    : Boolean(has("trend") && has("p_shape") && (version !== "A" || has("why")));
+}
+
+export function verificationStatus(version, answers, checks) {
+  const has = key => String(answers[key] || "").trim();
+  if (!["A", "B", "C"].includes(version)) return "incomplete";
+  if (!hasPrediction(version, answers)) return "incomplete";
+  if (!has("ai_result") || !["match", "differ"].includes(answers.prediction_match)) return "incomplete";
+  if (version === "C" && [0, 1, 2].some(i => !has(`cc_${i}`))) return "incomplete";
+  if (!checks.length || checks.some(item => !["ok", "bad", "unk"].includes(answers[`chk_${item.id}`])
+    || !has(`chkn_${item.id}`))) return "incomplete";
+  return answers.prediction_match === "differ" || checks.some(item => answers[`chk_${item.id}`] !== "ok")
+    ? "revise" : "pass";
 }
 
 function classCode(id, version) {
@@ -80,6 +99,7 @@ function copyText(text, button) {
 export function renderStudent(app, data, state, actions) {
   let currentAnswerKey = null;
   let saveTimer = null;
+  actions.registerFlush?.(flushSave);
 
   function loadCurrentAnswer() {
     if (!state.act) return;
@@ -88,6 +108,10 @@ export function renderStudent(app, data, state, actions) {
     currentAnswerKey = key;
     state.ans = actions.readStorage(key) || {};
     state.step = Number.isInteger(state.ans._step) ? state.ans._step : 0;
+    if (Number.isInteger(state.previewStep)) {
+      state.step = state.previewStep;
+      state.previewStep = null;
+    }
   }
 
   function save() {
@@ -107,6 +131,15 @@ export function renderStudent(app, data, state, actions) {
   }
 
   function setAnswer(key, value) {
+    if (["ai_result", "prediction_match"].includes(key) && hasPrediction(state.version, state.ans) && !state.ans._predictionAtVerification) {
+      state.ans._predictionAtVerification = state.version === "C" ? answer(state, "prediction_free")
+        : `${answer(state, "trend")} / ${answer(state, "p_shape")} / ${answer(state, "why")}`;
+    }
+    if (/^cc_\d$/.test(key) && state.ans[key] !== value) {
+      const id = key.replace("cc_", "cc");
+      delete state.ans[`chk_${id}`];
+      delete state.ans[`chkn_${id}`];
+    }
     state.ans[key] = value;
     save();
     refreshRail();
@@ -206,8 +239,10 @@ export function renderStudent(app, data, state, actions) {
     const header = `
       <div class="sheet-head stack">
         <span class="code">[${escapeHtml(activity.code)}] · ${SUBJ[activity.subj]}</span>
+        <span class="vbadge"><b>${state.version}</b>${VERSIONS[state.version].name} · 비계 버전</span>
         <h1>${escapeHtml(activity.title)}</h1>
         <p class="small muted">${escapeHtml(data.standards[activity.code])}</p>
+        ${activity.code === "12지구01-03" ? '<p class="small muted">“위상 영상”은 고시 원문 표기입니다. 탐구에는 관련 성취수준에 따라 위성 영상을 사용합니다.</p>' : ""}
       </div>`;
 
     app.innerHTML = `
@@ -216,6 +251,7 @@ export function renderStudent(app, data, state, actions) {
         <div class="sheet">
           ${header}
           <div id="sec"></div>
+          <p class="err" id="navError" role="alert" hidden></p>
           <div class="navrow">
             <button class="btn" type="button" id="prev">이전 단계</button>
             <button class="btn primary" type="button" id="next">다음 단계</button>
@@ -228,7 +264,18 @@ export function renderStudent(app, data, state, actions) {
       button.addEventListener("click", () => go(Number(button.dataset.step)));
     });
     document.getElementById("prev").addEventListener("click", () => go(state.step - 1));
-    document.getElementById("next").addEventListener("click", () => go(state.step + 1));
+    document.getElementById("next").addEventListener("click", () => {
+      if (state.step === 5) {
+        const status = verificationStatus(state.version, state.ans, checkList());
+        if (status === "incomplete") {
+          showNavigationError("§2.5의 예측(A는 근거 포함), AI 결과, 예측과의 비교, 모든 검증 항목의 판정과 근거를 기록하세요. C 버전은 자신의 기준 3개도 필요합니다.");
+          return;
+        }
+        go(status === "pass" ? 7 : 6);
+      } else if (state.step === 6) {
+        rerunRevision();
+      } else go(state.step + 1);
+    });
     document.getElementById("leave").addEventListener("click", () => {
       flushSave();
       state.act = null;
@@ -238,11 +285,43 @@ export function renderStudent(app, data, state, actions) {
     });
     document.getElementById("prev").disabled = state.step === 0;
     document.getElementById("next").hidden = state.step === SECTIONS.length - 1;
+    if (state.step === 5) document.getElementById("next").textContent = "검증 결과에 따라 이동";
+    if (state.step === 6) document.getElementById("next").textContent = "수정 프롬프트로 §3 재실행";
     renderSection();
+  }
+
+  function showNavigationError(message) {
+    const error = document.getElementById("navError");
+    error.textContent = message;
+    error.hidden = false;
+  }
+
+  function rerunRevision() {
+    const index = Math.max(1, Number(answer(state, "rounds_n")) || 1) - 1;
+    if (!String(answer(state, `r${index}_problem`)).trim() || !String(answer(state, `r${index}_prompt`)).trim()) {
+      showNavigationError("마지막 회차의 발견한 문제와 수정 프롬프트를 기록한 뒤 재실행하세요.");
+      return;
+    }
+    const history = state.ans._verificationHistory || [];
+    history.push({ prompt: promptText(), prediction: answer(state, "_predictionAtVerification"),
+      result: answer(state, "ai_result"), comparison: answer(state, "prediction_match"),
+      revisionReason: answer(state, `r${index}_problem`), revisionPrompt: answer(state, `r${index}_prompt`),
+      checks: checkList().map(item => ({ criterion: item.t, judgment: answer(state, `chk_${item.id}`), evidence: answer(state, `chkn_${item.id}`) })) });
+    state.ans._verificationHistory = history;
+    state.ans[state.version === "A" ? "prompt_final" : "prompt_free"] = answer(state, `r${index}_prompt`);
+    Object.keys(state.ans).filter(key => /^chk_|^chkn_/.test(key)).forEach(key => { delete state.ans[key]; });
+    delete state.ans.ai_result;
+    delete state.ans.prediction_match;
+    delete state.ans._predictionAtVerification;
+    go(4);
   }
 
   function go(index) {
     if (index < 0 || index >= SECTIONS.length) return;
+    if (index === 7 && verificationStatus(state.version, state.ans, checkList()) !== "pass") {
+      showNavigationError("§4의 모든 검증에 근거를 기록하세요. 문제·모름·예측 불일치가 남으면 §5에서 수정·재검증한 뒤 성찰로 이동합니다. 미완성 기록도 ‘정리’에서 저장할 수 있습니다.");
+      return;
+    }
     state.step = index;
     state.ans._step = index;
     save();
@@ -260,14 +339,16 @@ export function renderStudent(app, data, state, actions) {
   function isDone(key) {
     const has = field => String(answer(state, field)).trim() !== "";
     switch (key) {
-      case "s0": return has("pre_trust") && has("decl1");
+      case "s0": return has("pre_trust") && (state.version === "A"
+        ? isChecked(state, "decl1") && isChecked(state, "decl2") && isChecked(state, "decl3")
+        : state.version === "B" ? has("role_self") && has("role_ai") && has("role_check") : has("decl_own"));
       case "s1": return has("question");
-      case "s2": return has("period") && has("place");
-      case "s25": return has("trend") && has("why");
+      case "s2": return state.version === "C" ? has("context_free") : has("source") && has("period") && has("place");
+      case "s25": return hasPrediction(state.version, state.ans);
       case "s3": return has("prompt_final") || has("prompt_free");
-      case "s4": return checkList().some(item => has(`chk_${item.id}`));
+      case "s4": return verificationStatus(state.version, state.ans, checkList()) !== "incomplete";
       case "s5": return has("r0_problem") && has("r0_prompt");
-      case "s6": return has("post_trust") && has("conclusion");
+      case "s6": return has("post_trust") && (state.version === "C" ? has("reflection_free") : has("conclusion"));
       default: return false;
     }
   }
@@ -341,9 +422,9 @@ export function renderStudent(app, data, state, actions) {
 
   function checkList() {
     const activity = data.activities.find(item => item.id === state.act);
-    const checks = COMMON_CHECKS.map((item, index) => ({ id: `c${index}`, t: item.t, h: item.h, kind: "공통" }));
+    const checks = state.version === "C" ? [] : COMMON_CHECKS.map((item, index) => ({ id: `c${index}`, t: item.t, h: item.h, kind: "공통" }));
     activity.checks.forEach((item, index) => {
-      if (state.version !== "C") checks.push({ id: `a${index}`, t: item.t, h: item.h, kind: "이 활동" });
+      if (state.version === "A" || (state.version === "B" && index < 2)) checks.push({ id: `a${index}`, t: item.t, h: item.h, kind: "이 활동" });
     });
     if (state.version === "C") {
       [0, 1, 2].forEach(index => {
@@ -366,7 +447,7 @@ export function renderStudent(app, data, state, actions) {
             `).join("")}
           </div>
         </div>
-        ${state.version === "A" && item.h ? `<p class="vhint">${escapeHtml(item.h)}</p>` : ""}
+        ${state.version !== "C" && item.h ? `<p class="vhint">${escapeHtml(state.version === "A" ? item.h : item.h.split(/[。.!?]/)[0])}</p>` : ""}
         <input type="text" data-k="chkn_${item.id}" placeholder="근거나 메모" aria-label="메모">
       </div>`;
   }
@@ -384,6 +465,10 @@ export function renderStudent(app, data, state, actions) {
       "",
       "[탐구 질문]",
       answer(state, "question") || "(§1에서 탐구 질문을 쓰세요)",
+      "",
+      `[교육과정 성취기준: ${activity.code}]`,
+      data.standards[activity.code],
+      "이 기준과 연결해 분석하되, 자료로 확인하지 못한 개념이나 인과관계는 단정하지 마.",
       "",
       "[데이터]",
       `- 출처: ${answer(state, "source") || `${activity.data.org} ${activity.data.name}`}`,
@@ -437,12 +522,13 @@ export function renderStudent(app, data, state, actions) {
     const addLine = (label, value) => {
       if (String(value || "").trim()) lines.push(`${label}: ${value}`);
     };
-    lines.push(`[지구과학 바이브 코딩 워크시트] ${activity.title}`);
+    lines.push(`[지구과학 데이터 탐구 프롬프트 워크시트] ${activity.title}`);
     lines.push(`성취기준 [${activity.code}] ${data.standards[activity.code]}`);
     lines.push(`수업 코드 ${classCode(activity.id, state.version)} (${VERSIONS[state.version].name})`);
     addLine("이름", answer(state, "name"));
     addLine("AI 도구", answer(state, "tool"));
-    lines.push("", "§0 탐구 준비");
+    lines.push(`검증 상태: ${verificationStatus(state.version, state.ans, checkList()) === "pass" ? "모든 판정·근거 기록 및 예측 일치 (정확성의 자동 보증 아님)" : "미완료 또는 재검토 필요"}`);
+    lines.push("", "§0 역할 선언");
     addLine("역할 선언", [
       isChecked(state, "decl1") && "탐구자 선언",
       isChecked(state, "decl2") && "결과는 가설",
@@ -483,6 +569,7 @@ export function renderStudent(app, data, state, actions) {
     lines.push("", "§3 프롬프트", promptText() || "(없음)");
     if (state.version === "C") addLine("자기 평가(1~5)", answer(state, "p_self"));
     lines.push("", "§4 결과 검증");
+    addLine("예측과 결과 비교", answer(state, "prediction_match") === "match" ? "일치" : answer(state, "prediction_match") === "differ" ? "불일치" : "");
     addLine("AI 결과", answer(state, "ai_result"));
     const labels = { ok: "맞음", bad: "문제 있음", unk: "모르겠음" };
     checkList().forEach(item => {
@@ -511,6 +598,14 @@ export function renderStudent(app, data, state, actions) {
     addLine("동의하지 않는 부분", answer(state, "disagree"));
     addLine("다음에 바꿀 점", answer(state, "next"));
     addLine("성취수준 자기 점검", answer(state, "self_level"));
+    addLine("역할 선언", state.version === "B" ? `나: ${answer(state, "role_self")} / AI: ${answer(state, "role_ai")} / 검증: ${answer(state, "role_check")}` : answer(state, "decl_own"));
+    addLine("자유 데이터 맥락", answer(state, "context_free"));
+    addLine("자유 예측", answer(state, "prediction_free"));
+    addLine("자유 성찰", answer(state, "reflection_free"));
+    ["source", "concept", "evidence", "limits"].forEach(key => addLine(`성찰 점검 ${key}`, answer(state, `reflect_${key}`) ? "확인" : ""));
+    if (state.ans._verificationHistory?.length) {
+      lines.push("", "재실행 전 검증 이력", JSON.stringify(state.ans._verificationHistory, null, 2));
+    }
     return lines.join("\n");
   }
 
@@ -524,7 +619,7 @@ export function renderStudent(app, data, state, actions) {
     if (sectionKey === "s0") {
       html = sectionWrap(0, "AI는 탐구를 돕는 도구이고, 결론을 내리는 사람은 나입니다. 시작하기 전에 역할을 분명히 해 두세요.", `
         <div class="row">
-          ${inputField("name", "이름(학번)", "예: 2학년 3반 12번 김지구")}
+          ${inputField("name", "이름 또는 별칭 (선택)", "교사 검토는 익명 별칭 사용", "설문과 별도인 로컬 기록입니다. 개인정보·민감 정보는 입력하지 마세요.")}
           <div class="field">
             <label for="f_tool">사용할 AI 도구</label>
             <select id="f_tool" data-k="tool">
@@ -533,19 +628,22 @@ export function renderStudent(app, data, state, actions) {
           </div>
         </div>
         <div class="field">
-          <span class="flabel">역할 선언</span>
+          <span class="flabel">역할 선언 · ${VERSIONS[state.version].name}</span>
+          ${state.version === "A" ? `
           <label class="check"><input type="checkbox" data-k="decl1"> 나는 탐구 질문과 결론을 스스로 정하는 탐구자이다.</label>
           <label class="check"><input type="checkbox" data-k="decl2"> AI가 만든 그래프와 계산은 내가 검증하기 전까지 '가설'로 본다.</label>
           <label class="check"><input type="checkbox" data-k="decl3"> 내가 사용한 데이터의 출처와 AI 사용 과정을 정직하게 기록한다.</label>
+          ` : state.version === "B" ? `
+          <p>나는 ___을 결정하고, AI는 ___을 돕는다. AI 결과는 ___으로 확인한다.</p>
+          ${inputField("role_self", "내가 결정할 것", "")}
+          ${inputField("role_ai", "AI가 도울 것", "")}
+          ${inputField("role_check", "결과를 검증할 방법", "")}
+          ` : `
+          <p class="note">역할 선언 기준: 탐구의 주체, AI의 역할과 한계, 결과를 검증할 책임, 출처·사용 기록의 정직성이 드러나야 합니다.</p>
+          ${textareaField("decl_own", "나의 역할 선언", "", "", 3)}`}
         </div>
-        ${state.version === "C" ? textareaField("decl_own", "나만의 약속 한 가지", "이번 탐구에서 특히 조심할 점을 스스로 정하세요.", "예: AI가 단위를 바꾸면 반드시 원자료와 비교한다.") : ""}
         ${scaleField("pre_trust", "AI가 만든 그래프나 계산 결과를 그대로 믿어도 된다고 생각하나요?", "전혀 아니다", "매우 그렇다")}
-        ${state.version === "C" && data.levels[activity.code] ? `
-          <div class="field">
-            <span class="flabel">이번 탐구의 목표 (성취수준)</span>
-            <div class="note">${escapeHtml(data.levels[activity.code].A)}</div>
-            <span class="hint">성취수준 A 수준을 목표로 합니다. 마지막 §6에서 스스로 점검합니다.</span>
-          </div>` : ""}`);
+        <p class="small muted">비계 버전 A·B·C는 지원의 양입니다. 교육과정의 성취수준 A~E나 학생의 등급을 뜻하지 않습니다.</p>`);
     } else if (sectionKey === "s1") {
       let body = "";
       if (state.version === "A") {
@@ -560,28 +658,25 @@ export function renderStudent(app, data, state, actions) {
             </div>
           </div>
           <div class="field"><span class="flabel">예시 질문 (눌러서 가져오기)</span><div class="starters">
-            ${activity.questions.map((question, index) => `<button type="button" data-ex="${index}">${escapeHtml(question)}</button>`).join("")}
+            ${questionChoices(activity).map((question, index) => `<button type="button" data-ex="${index}">${escapeHtml(question)}</button>`).join("")}
           </div></div>
           ${textareaField("question", "나의 탐구 질문", "빈칸을 채우면 자동으로 만들어집니다. 자연스럽게 다듬어도 됩니다.", "", 2)}`;
       } else if (state.version === "B") {
         body = `
-          <div class="field"><span class="flabel">질문 유형을 하나 고르세요</span><div class="cards">
-            ${Q_TYPES.map(item => `<button type="button" class="card" data-pick="qtype|${item.k}"><b>${item.b}</b><span>${item.s}</span></button>`).join("")}
+          <div class="field"><span class="flabel">질문 선택지 (또는 자유롭게 작성)</span><div class="starters">
+            ${questionChoices(activity).slice(0, 2).map((question, index) => `<button type="button" data-ex="${index}">${escapeHtml(question)}</button>`).join("")}
           </div></div>
-          ${textareaField("question", "나의 탐구 질문", "고른 유형의 문장 틀을 참고해 직접 쓰세요.", "", 2)}
-          <details class="details"><summary>예시 질문 보기</summary><ul class="plain small">
-            ${activity.questions.map(question => `<li>${escapeHtml(question)}</li>`).join("")}
-          </ul></details>`;
+          ${textareaField("question", "나의 탐구 질문", "선택지를 다듬거나 새로운 질문을 직접 쓰세요.", "", 2)}`;
       } else {
         body = `
           ${textareaField("question", "나의 탐구 질문", "", "", 2)}
           <div class="note"><b>좋은 탐구 질문의 기준</b><ul class="plain">
             <li>내가 구할 수 있는 데이터로 답할 수 있다.</li>
             <li>변수, 기간, 지역(대상)이 드러난다.</li>
-            <li>답을 찾으면 성취기준의 지구과학 개념을 설명하는 데 도움이 된다.</li>
+            <li>답을 찾으면 해당 성취기준의 과학 개념을 설명하는 데 도움이 된다.</li>
           </ul></div>`;
       }
-      body += textareaField("q_why", "이 질문을 고른 이유", "어떤 지구과학 개념과 연결되나요?", "", 2);
+      body += textareaField("q_why", "이 질문을 고른 이유", "어떤 과학 개념과 연결되나요?", "", 2);
       html = sectionWrap(1, "데이터로 답할 수 있는 질문을 정합니다.", body);
     } else if (sectionKey === "s2") {
       const dataset = activity.data;
@@ -607,34 +702,41 @@ export function renderStudent(app, data, state, actions) {
           </table></div>
           <span class="hint">단위와 범위는 원자료의 설명(메타데이터)이나 교과서에서 확인하세요.</span>`;
       } else {
-        variables = textareaField("vars_free", "사용할 변수, 단위, 물리적으로 가능한 범위", "변수마다 한 줄씩 쓰세요.", "예: 수온 / °C / -2 ~ 30", 4);
+        variables = "";
       }
       html = sectionWrap(2, "AI는 내가 알려 준 만큼만 자료를 이해합니다. 자료의 출처, 범위, 단위를 정확히 적으세요.", `
         <div class="datacard">
           <span class="label">이 활동의 데이터</span><b>${escapeHtml(dataset.name)}</b>
           <span class="small">${escapeHtml(dataset.org)}${dataset.url ? ` · <a href="${escapeHtml(dataset.url)}" target="_blank" rel="noopener">${escapeHtml(dataset.url)}</a>` : ""}</span>
-          <span class="small muted">${escapeHtml(dataset.how)}</span>
+          ${state.version === "A" ? `<span class="small muted">${escapeHtml(dataset.how)}</span>` : ""}
         </div>
+        ${state.version === "C" ? `
+        <div class="note"><b>데이터 맥락 자가 완성 체크리스트</b>
+          ${["출처·파일과 접근 경로", "기간과 지역·대상", "변수·단위·관측 간격", "값 범위와 결측·이상값", "측정 조건과 자료의 한계"].map((item, index) => `<label class="check"><input type="checkbox" data-k="context_check_${index}">${item}</label>`).join("")}
+        </div>
+        ${textareaField("context_free", "데이터 맥락 기술", "위 기준을 스스로 확인하며 자유롭게 작성하세요.", "", 8)}
+        ` : `
         <div class="row">
           ${inputField("source", "출처", `${dataset.org} ${dataset.name}`)}
           ${inputField("period", "기간", "예: 2015년 1월 ~ 2024년 12월")}
           ${inputField("place", "지역·관측소·대상", "예: 서울(108), 동해 105선")}
         </div>
         <div class="field"><span class="flabel">변수와 단위</span>${variables}</div>
-        ${textareaField("data_note", "자료를 열어 보고 알게 된 점", "결측(빈칸, -999 등), 특이한 값, 열 이름 등을 적으세요.", "예: 2019년 3월 자료가 비어 있다.", 3)}`);
+        ${state.version === "A" ? textareaField("data_note", "자료를 열어 보고 알게 된 점", "결측(빈칸, -999 등), 특이한 값, 열 이름 등을 적으세요.", "예: 2019년 3월 자료가 비어 있다.", 3) : ""}`}`);
     } else if (sectionKey === "s25") {
       html = sectionWrap(3, "AI 결과를 보기 전에 나의 예측을 적어 둡니다. 예측은 AI 결과를 비판적으로 볼 기준점이 됩니다.", `
-        <div class="note">${escapeHtml(activity.predict)}</div>
+        ${state.version === "C" ? textareaField("prediction_free", "나의 예측", "결과를 보기 전에 예상과 과학적 근거를 자유롭게 기록하세요.", "", 7) : `
+        ${state.version === "A" ? `<div class="note">${escapeHtml(activity.predict)}</div>` : ""}
         <div class="field"><span class="flabel">예상하는 경향</span><div class="starters" role="group" aria-label="예상 경향">
           ${TRENDS.map(trend => `<button type="button" data-pick="trend|${trend}">${trend}</button>`).join("")}
         </div></div>
-        <div class="row">
-          ${inputField("p_min", "예상 최솟값", "")}
-          ${inputField("p_max", "예상 최댓값", "")}
-          ${inputField("p_unit", "단위", "")}
-        </div>
-        ${textareaField("p_shape", "그래프 모양 설명", "그래프를 그린다면 어떤 모양일지 말로 설명하세요.", "예: 오른쪽 위로 올라가다가 1992년 무렵 잠시 내려간다.", 2)}
-        ${textareaField("why", "그렇게 예상한 이유", "배운 지구과학 개념을 근거로 쓰세요.", "", 3)}`);
+        <div class="tbl-wrap"><table class="vars"><caption>예측 표 (수치 예상이 가능한 경우 범위도 기록)</caption><tbody><tr>
+          <td>${inputField("p_min", "예상 최솟값", "")}</td>
+          <td>${inputField("p_max", "예상 최댓값", "")}</td>
+          <td>${inputField("p_unit", "단위", "")}</td>
+        </tr></tbody></table></div>
+        ${textareaField("p_shape", "그래프 모양 설명", "", "", 2)}
+        ${state.version === "A" ? textareaField("why", "예측의 과학적 근거", "배운 개념을 근거로 빈칸을 완성하세요.", "___ 개념에 따르면 ___ 때문에 ___할 것으로 예상한다.", 3) : ""}`}`);
     } else if (sectionKey === "s3") {
       let body;
       if (state.version === "A") {
@@ -660,6 +762,9 @@ export function renderStudent(app, data, state, actions) {
           ${textareaField("prompt_final", "AI에 실제로 보낸 프롬프트", "직접 고친 경우 여기에 최종본이 남습니다.", "", 6)}`;
       } else if (state.version === "B") {
         body = `
+          <div class="field"><span class="flabel">질문 유형 카드</span><div class="cards">
+            ${Q_TYPES.map(item => `<button type="button" class="card" data-pick="qtype|${item.k}"><b>${item.b}</b><span>${item.s}</span></button>`).join("")}
+          </div></div>
           <div class="field">
             <span class="flabel">프롬프트 요소 카드</span>
             <span class="hint">좋은 프롬프트에 들어갈 요소입니다. 내 프롬프트에 넣은 요소를 체크하세요.</span>
@@ -688,11 +793,18 @@ export function renderStudent(app, data, state, actions) {
       const checks = checkList();
       let body = `
         <div class="predict-recap">
-          <b>나의 예측</b> · ${escapeHtml(answer(state, "trend") || "(아직 없음)")}
+          <b>나의 예측</b> · ${escapeHtml(state.version === "C" ? answer(state, "prediction_free") || "(아직 없음)" : answer(state, "trend") || "(아직 없음)")}
           ${answer(state, "p_min") || answer(state, "p_max") ? ` · 범위 ${escapeHtml(answer(state, "p_min"))} ~ ${escapeHtml(answer(state, "p_max"))} ${escapeHtml(answer(state, "p_unit"))}` : ""}
           <br><span class="small muted">${escapeHtml(answer(state, "p_shape"))}</span>
         </div>
-        ${textareaField("ai_result", "AI가 만든 결과 기록", "그래프의 모양, 핵심 수치, AI의 설명을 옮겨 적으세요. 그래프 이미지는 따로 저장해 두세요.", "", 4)}`;
+        ${textareaField("ai_result", "AI가 만든 결과 기록", "그래프의 모양, 핵심 수치, AI의 설명을 옮겨 적으세요. 그래프 이미지는 따로 저장해 두세요.", "", 4)}
+        <div class="field"><span class="flabel">예측–결과 비교</span>
+          <div class="cards">
+            <button type="button" class="card" data-pick="prediction_match|match">예측과 일치</button>
+            <button type="button" class="card" data-pick="prediction_match|differ">예측과 불일치</button>
+          </div>
+          <p class="hint">일치는 정확성의 증명이 아니며 불일치는 오류의 증거가 아닙니다. 원자료·계산·개념을 확인하고, 불일치하면 §5에서 예측 또는 분석을 재검토하세요.</p>
+        </div>`;
       if (state.version === "C") {
         body += `
           <div class="field">
@@ -703,11 +815,6 @@ export function renderStudent(app, data, state, actions) {
       }
       body += `<div class="field"><span class="flabel">검증 체크</span><div class="tally" id="tally"></div></div>
         <div class="stack" id="vlist">${checks.map(verificationRow).join("")}</div>`;
-      if (state.version === "C") {
-        body += `<details class="details"><summary>내 기준을 세운 뒤, 참고 기준과 비교하기</summary><ul class="plain small">
-          ${activity.checks.map(item => `<li>${escapeHtml(item.t)}</li>`).join("")}
-        </ul></details>`;
-      }
       html = sectionWrap(5, "AI 결과를 하나씩 확인합니다. 하나라도 '문제 있음'이면 §5에서 고쳐 다시 요청합니다.", body);
     } else if (sectionKey === "s5") {
       const roundCount = Math.max(1, Number(answer(state, "rounds_n")) || 1);
@@ -721,20 +828,27 @@ export function renderStudent(app, data, state, actions) {
         body += `
           <div class="round">
             <h3><span class="mono">${index + 1}회차</span> 수정</h3>
-            ${textareaField(`r${index}_problem`, "발견한 문제", "무엇이, 왜 잘못되었나요?", "", 2)}
-            ${state.version !== "C" ? `
+            ${textareaField(`r${index}_problem`, state.version === "C" ? "수정·재검토 기록" : "발견한 문제와 근거", state.version === "A" ? "무엇이 왜 문제인지, 원자료·계산·예측 중 어느 것을 재검토했는지 쓰세요." : "", "", state.version === "C" ? 5 : 2)}
+            ${state.version === "A" ? `
               <div class="field"><span class="flabel">수정 프롬프트 문장 틀 (눌러서 넣기)</span><div class="starters">
                 ${STARTERS.map((starter, starterIndex) => `<button type="button" data-starter="${index}|${starterIndex}">${escapeHtml(starter)}</button>`).join("")}
-              </div></div>` : ""}
+              </div></div>` : state.version === "B" ? '<p class="note">문제 → 수정 요청 → 재실행 결과를 연결해 기록하세요.</p>' : ""}
             ${textareaField(`r${index}_prompt`, "수정해서 보낸 프롬프트", "", "", 3)}
-            ${textareaField(`r${index}_change`, "결과가 어떻게 바뀌었나요?", "문제가 해결되었는지, 새 문제가 생겼는지 쓰세요.", "", 2)}
+            ${state.version !== "C" ? textareaField(`r${index}_change`, "재실행 후 결과 변화", state.version === "A" ? "재실행과 재검증 후 돌아와 해결 여부와 새 문제를 기록하세요." : "", "", 2) : ""}
           </div>`;
       }
       body += '<div><button class="btn" type="button" id="addRound">수정 회차 추가</button></div>';
-      html = sectionWrap(6, "검증에서 찾은 문제를 근거로 프롬프트를 고쳐 다시 요청합니다. 몇 번을 반복했는지도 탐구의 기록입니다.", body);
+      html = sectionWrap(6, "근거를 검토해 프롬프트를 수정하고 §3에서 재실행한 뒤 §4에서 다시 검증합니다. 예측이 잘못되었다면 이유를 기록하고 §2.5에서 수정하세요. 일치를 만들기 위해 관측값을 바꾸면 안 됩니다. 재실행 전 예측·결과·판정은 정리에 이력으로 남습니다.", body);
     } else if (sectionKey === "s6") {
       const level = data.levels[activity.code];
-      let body = `
+      let body = state.version === "C" ? `
+        ${scaleField("post_trust", "탐구 후 AI 결과를 그대로 믿어도 된다고 생각하나요?", "전혀 아니다", "매우 그렇다")}
+        <p class="small muted" id="trustCmp"></p>
+        ${textareaField("reflection_free", "나의 성찰", "탐구 결론과 근거, 나와 AI의 역할, 검증 경험을 되돌아보세요.", "", 9)}
+      ` : `
+        ${state.version === "A" ? `<div class="field"><span class="flabel">성찰 체크리스트</span>
+          ${[["source", "자료와 AI 사용 과정을 정직하게 기록했다."], ["concept", "성취기준의 과학 개념으로 결과를 설명했다."], ["evidence", "검증한 수치를 근거로 결론을 냈다."], ["limits", "불확실성과 탐구의 한계를 구분했다."]].map(([key, text]) => `<label class="check"><input type="checkbox" data-k="reflect_${key}">${text}</label>`).join("")}
+        </div>` : ""}
         ${scaleField("post_trust", "탐구를 마친 지금, AI 결과를 그대로 믿어도 된다고 생각하나요?", "전혀 아니다", "매우 그렇다")}
         <p class="small muted" id="trustCmp"></p>
         ${textareaField("conclusion", "탐구 질문에 대한 나의 결론", "§1의 질문에 답하고, 근거가 된 수치를 함께 쓰세요.", "", 4)}
@@ -742,7 +856,7 @@ export function renderStudent(app, data, state, actions) {
         ${textareaField("errors", "AI 결과에서 찾은 오류와 찾아낸 방법", "어떤 단서로 오류를 알아챘나요? 오류가 없었다면 어떻게 확인했나요?", "", 3)}
         ${textareaField("disagree", "AI 설명 중 동의하지 않거나 더 확인이 필요한 부분", "", "", 2)}
         ${textareaField("next", "다음에 AI로 데이터를 탐구할 때 바꿀 점", "", "", 2)}`;
-      if (level) {
+      if (level && state.version !== "C") {
         body += `
           <div class="field">
             <span class="flabel">성취수준 자기 점검</span>
@@ -762,7 +876,7 @@ export function renderStudent(app, data, state, actions) {
           <button class="btn primary" type="button" id="sumCopy">전체 기록 복사</button>
           <button class="btn" type="button" id="sumDownload">텍스트 파일로 저장</button>
           <button class="btn" type="button" id="sumPrint">인쇄하기</button>
-          <span class="small muted">이 기록은 이 브라우저에만 저장되어 있습니다. 제출 전 꼭 복사해 두세요.</span>
+          <span class="small muted">미완성 기록도 저장할 수 있습니다. 검증 완료를 뜻하지 않습니다. 이 기록은 연구자에게 자동 전송되지 않습니다.</span>
         </div>
         <div class="summary-out" id="sumOut"></div>
         <details class="details">
@@ -795,9 +909,11 @@ export function renderStudent(app, data, state, actions) {
           refreshRail();
         }
       });
+    }
+    if (sectionKey === "s1" && state.version !== "C") {
       container.querySelectorAll("[data-ex]").forEach(button => {
         button.addEventListener("click", () => {
-          state.ans.question = data.activities.find(item => item.id === state.act).questions[Number(button.dataset.ex)];
+          state.ans.question = questionChoices(data.activities.find(item => item.id === state.act))[Number(button.dataset.ex)];
           document.getElementById("f_question").value = state.ans.question;
           setAnswer("question", state.ans.question);
         });
@@ -887,17 +1003,13 @@ export function renderStudent(app, data, state, actions) {
       };
       bindChecks();
       if (state.version === "C") {
-        let criteriaTimer;
         liveHooks.push(key => {
           if (!/^cc_/.test(key)) return;
-          window.clearTimeout(criteriaTimer);
-          criteriaTimer = window.setTimeout(() => {
-            const list = document.getElementById("vlist");
-            list.innerHTML = checkList().map(verificationRow).join("");
-            bindFields(list);
-            bindChecks();
-            updateTally();
-          }, 500);
+          const list = document.getElementById("vlist");
+          list.innerHTML = checkList().map(verificationRow).join("");
+          bindFields(list);
+          bindChecks();
+          updateTally();
         });
       }
     }

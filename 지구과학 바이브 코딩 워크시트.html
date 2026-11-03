@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>지구과학 데이터 탐구 프롬프트 워크시트</title>
+</head>
+<body>
+  <h1>지구과학 데이터 탐구 프롬프트 워크시트</h1>
+  <p>최신 워크시트로 이동합니다. 로컬에서는 Live Server 등 웹 서버로 실행하세요.</p>
+  <p><a href="./index.html" id="latest">최신 워크시트 열기</a></p>
+  <script>
+    const target = new URL("./index.html", location.href);
+    target.hash = location.hash;
+    document.getElementById("latest").href = target.href;
+    if (location.protocol !== "file:") location.replace(target.href);
+  </script>
+</body>
+</html>
